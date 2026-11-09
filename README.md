@@ -14,7 +14,7 @@ Version `2.0.0` tracks the source constitution.
   "version": 1,
   "skills": {
     "flat-ui-contract": {
-      "source": "mahardikalgw/flat-ui-contract",
+      "source": "mahardikalgw/ruby-flat-ui-contract",
       "sourceType": "github",
       "skillPath": "SKILL.md"
     }
@@ -25,8 +25,8 @@ Version `2.0.0` tracks the source constitution.
 Or clone and symlink:
 
 ```bash
-git clone git@github.com:mahardikalgw/flat-ui-contract.git
-ln -s "$PWD/flat-ui-contract" .claude/skills/flat-ui-contract
+git clone git@github.com:mahardikalgw/ruby-flat-ui-contract.git
+ln -s "$PWD/ruby-flat-ui-contract" .claude/skills/flat-ui-contract
 ```
 
 ## When to activate
@@ -40,8 +40,9 @@ ln -s "$PWD/flat-ui-contract" .claude/skills/flat-ui-contract
 ## What's inside
 
 ```
-flat-ui-contract/
+ruby-flat-ui-contract/
   SKILL.md
+  bin/check-skill
   references/inv-1-9.md
   references/theme-tokens.md
   scripts/check-theme
@@ -63,8 +64,8 @@ repository — that vendored scripts still match it byte for byte. Runs in CI on
 
 ## Related skills
 
-- [`merge-gate-parity`](https://github.com/mahardikalgw/merge-gate-parity) — one gate list in every file, a script contract, and local/CI triage
-- [`inertia-vertical-slice`](https://github.com/mahardikalgw/inertia-vertical-slice) — route → skinny controller → query/service → typed props → Inertia page → test
+- [`merge-gate-parity`](https://github.com/mahardikalgw/ruby-merge-gate-parity) — one gate list in every file, a script contract, and local/CI triage
+- [`inertia-vertical-slice`](https://github.com/mahardikalgw/ruby-inertia-vertical-slice) — route → skinny controller → query/service → typed props → Inertia page → test
 
 ## Licence
 
