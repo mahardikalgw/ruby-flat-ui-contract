@@ -1,0 +1,229 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Enforces the Roma palette contract (feature 006):
+#
+#   THEME-1  every colour declared in :root is mapped in @theme inline, and every
+#            --color-* mapping resolves to a declared role (FR-001, SC-006)
+#   THEME-2  no literal colour exists outside the palette block: no hex, rgb(), hsl(),
+#            bg-white/bg-black utilities, or Tailwind palette classes in application
+#            code or in the static pages (FR-001, FR-013, SC-006)
+#   THEME-3  every recorded pairing meets its WCAG 2.1 threshold, recomputed from the
+#            live oklch() values (FR-036, SC-002, SC-010)
+#
+# The pairing matrix below is the machine copy of
+# specs/006-roma-color-palette/contracts/palette.md section 3. When a value changes,
+# change it in application.css and re-measure the contract - never relax a threshold.
+#
+# Tints (:nn) are composited in sRGB space over white; text alphas are composited over
+# their own background, which is how the browser paints them.
+#
+# Exit 0 when clean, 1 when any violation is found.
+
+ROOT = File.expand_path("..", __dir__)
+STYLESHEET = "app/javascript/entrypoints/application.css"
+STATIC_PAGES = Dir.glob(File.join(ROOT, "public/*.html")).sort.map { |path| path.delete_prefix("#{ROOT}/") }
+ICON = "public/icon.svg"
+STATIC_PALETTE = %w[#F7F7F8 #191A1C #8E1F2F #E6E6EA].freeze
+ICON_COLOUR = "#8E1F2F"
+
+LITERAL_PATTERNS = [
+  [/\B#[0-9a-fA-F]{3,8}\b/, "literal hex colour"],
+  [/\brgba?\(/, "literal rgb() colour"],
+  [/\bhsla?\(/, "literal hsl() colour"],
+  [/\b(?:bg|text|border|ring|divide|outline|decoration|fill|stroke|from|via|to)-(?:white|black)\b/, "literal black/white utility"],
+  [/\b(?:bg|text|border|ring|divide|outline|decoration|fill|stroke|from|via|to)-(?:slate|gray|zinc|neutral|stone|red|orange|amber|yellow|lime|green|emerald|teal|cyan|sky|blue|indigo|violet|purple|fuchsia|pink|rose)-[0-9]{2,3}\b/, "Tailwind palette class"]
+].freeze
+
+# [foreground token, foreground alpha, background token, background alpha, minimum ratio, label]
+PAIRINGS = [
+  ["--foreground", nil, "--background", nil, 4.5, "body copy on canvas"],
+  ["--foreground", nil, "--card", nil, 4.5, "body copy on card"],
+  ["--muted-foreground", nil, "--card", nil, 4.5, "helper text on card"],
+  ["--muted-foreground", nil, "--background", nil, 4.5, "helper text on canvas"],
+  ["--muted-foreground", nil, "--secondary", nil, 4.5, "labels on secondary"],
+  ["--muted-foreground", nil, "--muted", nil, 4.5, "helper text on muted"],
+  ["--muted-foreground", nil, "--accent", nil, 4.5, "helper text in a chip"],
+  ["--secondary-foreground", nil, "--secondary", nil, 4.5, "secondary button label"],
+  ["--accent-foreground", nil, "--accent", nil, 4.5, "current nav item, chips, beta badge"],
+  ["--primary-foreground", nil, "--primary", nil, 4.5, "primary button label, brand mark"],
+  ["--primary-foreground", 0.8, "--primary", nil, 4.5, "small text on the auth panel"],
+  ["--highlight-foreground", nil, "--highlight", nil, 4.5, "text on a gold fill"],
+  ["--muted-foreground", 0.7, "--card", nil, 3.0, "disabled nav item"],
+  ["--destructive-foreground", nil, "--destructive", nil, 4.5, "destructive button label"],
+  ["--destructive", nil, "--destructive", 0.05, 4.5, "destructive alert text"],
+  ["--negative-foreground", nil, "--negative", 0.16, 4.5, "negative badge text"],
+  ["--positive-foreground", nil, "--positive", 0.18, 4.5, "positive badge text"],
+  ["--warning-foreground", nil, "--warning", 0.15, 4.5, "warning alert text"],
+  ["--warning-foreground", nil, "--warning", 0.10, 4.5, "internal comment text"],
+  ["--foreground", nil, "--primary", 0.05, 4.5, "informational alert text"],
+  ["--negative-foreground", nil, "--card", nil, 4.5, "negative text on card"],
+  ["--input", nil, "--card", nil, 3.0, "field boundary on card"],
+  ["--input", nil, "--background", nil, 3.0, "field boundary on canvas"],
+  ["--ring", nil, "--card", nil, 3.0, "focus outline on card"],
+  ["--ring", nil, "--background", nil, 3.0, "focus outline on canvas"],
+  ["--highlight", nil, "--primary", nil, 3.0, "gold mark and focus on a maroon panel"],
+  ["--chart-1", nil, "--card", nil, 3.0, "chart series 1"],
+  ["--chart-2", nil, "--card", nil, 3.0, "chart series 2"],
+  ["--chart-3", nil, "--card", nil, 3.0, "chart series 3"],
+  ["--chart-4", nil, "--card", nil, 3.0, "chart series 4"],
+  ["--chart-5", nil, "--card", nil, 3.0, "chart series 5"],
+  ["--positive", nil, "--card", nil, 3.0, "positive delta text"],
+  ["--warning", nil, "--card", nil, 3.0, "warning icon and border base"]
+].freeze
+
+WHITE = [1.0, 1.0, 1.0].freeze
+
+violations = []
+
+stylesheet_path = File.join(ROOT, STYLESHEET)
+css = File.read(stylesheet_path)
+root_block = css[/^:root\s*\{(.*?)^\}/m, 1].to_s
+theme_block = css[/^@theme inline\s*\{(.*?)^\}/m, 1].to_s
+
+def declarations(block)
+  block.scan(/^\s*(--[a-z0-9-]+)\s*:\s*([^;]+);/).to_h
+end
+
+def to_linear(channel)
+  channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055)**2.4
+end
+
+def luminance(rgb)
+  (0.2126 * to_linear(rgb[0])) + (0.7152 * to_linear(rgb[1])) + (0.0722 * to_linear(rgb[2]))
+end
+
+def contrast(a, b)
+  first = luminance(a)
+  second = luminance(b)
+  ([first, second].max + 0.05) / ([first, second].min + 0.05)
+end
+
+def composite(foreground, alpha, background)
+  return foreground if alpha.nil?
+
+  [0, 1, 2].map { |index| (foreground[index] * alpha) + (background[index] * (1 - alpha)) }
+end
+
+def encode(channel)
+  channel = channel.clamp(0.0, 1.0)
+  channel <= 0.0031308 ? 12.92 * channel : (1.055 * (channel**(1.0 / 2.4))) - 0.055
+end
+
+def parse_oklch(value)
+  match = value.match(/oklch\(\s*([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*\)/)
+  return nil unless match
+
+  lightness = match[1].to_f
+  chroma = match[2].to_f
+  hue = match[3].to_f * Math::PI / 180
+  a = chroma * Math.cos(hue)
+  b = chroma * Math.sin(hue)
+  l = (lightness + (0.3963377774 * a) + (0.2158037573 * b))**3
+  m = (lightness - (0.1055613458 * a) - (0.0638541728 * b))**3
+  s = (lightness - (0.0894841775 * a) - (1.2914855480 * b))**3
+  [
+    (4.0767416621 * l) - (3.3077115913 * m) + (0.2309699292 * s),
+    (-1.2684380046 * l) + (2.6097574011 * m) - (0.3413193965 * s),
+    (-0.0041960863 * l) - (0.7034186147 * m) + (1.7076147010 * s)
+  ].map { |channel| encode(channel) }
+end
+
+def resolve(token, tokens)
+  value = tokens[token]
+  return nil if value.nil?
+
+  alias_match = value.match(/var\((--[a-z0-9-]+)\)/)
+  return resolve(alias_match[1], tokens) if alias_match
+
+  parse_oklch(value)
+end
+
+tokens = declarations(root_block)
+if tokens.empty?
+  violations << "#{STYLESHEET}:1: no :root palette block found (THEME-1)"
+end
+
+colour_tokens = tokens.keys.reject { |token| token == "--radius" }
+mapped_tokens = declarations(theme_block).select { |token, _| token.start_with?("--color-") }
+
+colour_tokens.each do |token|
+  mapping = "--color-#{token.delete_prefix("--")}"
+  next if mapped_tokens.key?(mapping)
+
+  violations << "#{STYLESHEET}:1: #{token} is declared but has no #{mapping} mapping (THEME-1)"
+end
+
+mapped_tokens.each do |mapping, value|
+  base = value[/var\((--[a-z0-9-]+)\)/, 1]
+  if base.nil?
+    violations << "#{STYLESHEET}:1: #{mapping} must reference a :root role (THEME-1)"
+  elsif !tokens.key?(base)
+    violations << "#{STYLESHEET}:1: #{mapping} references #{base}, which is not declared (THEME-1)"
+  end
+end
+
+PAIRINGS.each do |foreground_token, foreground_alpha, background_token, background_alpha, minimum, label|
+  foreground = resolve(foreground_token, tokens)
+  background = resolve(background_token, tokens)
+
+  if foreground.nil? || background.nil?
+    missing = foreground.nil? ? foreground_token : background_token
+    violations << "#{STYLESHEET}:1: #{label}: #{missing} is not a declared oklch role (THEME-3)"
+    next
+  end
+
+  background = composite(background, background_alpha, WHITE)
+  foreground = composite(foreground, foreground_alpha, background)
+  ratio = contrast(foreground, background)
+  next if ratio >= minimum
+
+  violations << "#{STYLESHEET}:1: #{label} measures #{ratio.round(2)}:1, below #{minimum}:1 (THEME-3)"
+end
+
+source_paths = Dir.glob(File.join(ROOT, "app/javascript/**/*.{ts,tsx,css}")) +
+               Dir.glob(File.join(ROOT, "app/views/**/*")).select { |path| File.file?(path) }
+
+source_paths.sort.each do |path|
+  relative = path.delete_prefix("#{ROOT}/")
+  source = File.read(path)
+  if relative == STYLESHEET
+    source = source.sub(/^:root\s*\{.*?^\}/m, "").sub(/^@theme inline\s*\{.*?^\}/m, "")
+  end
+
+  source.each_line.with_index(1) do |line, number|
+    LITERAL_PATTERNS.each do |pattern, message|
+      violations << "#{relative}:#{number}: #{message} (THEME-2)" if line.match?(pattern)
+    end
+  end
+end
+
+STATIC_PAGES.each do |relative|
+  source = File.read(File.join(ROOT, relative))
+
+  if source.match?(/prefers-color-scheme/)
+    violations << "#{relative}:1: declares a second (dark) palette; the product is light-only (THEME-2)"
+  end
+
+  source.scan(/#[0-9a-fA-F]{3,8}\b/).map(&:upcase).uniq.each do |colour|
+    next if STATIC_PALETTE.include?(colour)
+
+    violations << "#{relative}:1: #{colour} is not a palette value of #{STATIC_PALETTE.join(", ")} (THEME-2)"
+  end
+end
+
+icon = File.read(File.join(ROOT, ICON))
+icon.scan(/(?:fill|stroke|stop-color)="([^"]+)"/).flatten.uniq.each do |colour|
+  next if ["none", ICON_COLOUR].include?(colour)
+
+  violations << "#{ICON}:1: #{colour} is not the identity colour #{ICON_COLOUR} (THEME-2)"
+end
+
+if violations.empty?
+  puts "check-theme: #{PAIRINGS.size} pairings, #{colour_tokens.size} colour tokens, 0 violations"
+  exit 0
+end
+
+violations.sort.each { |violation| puts violation }
+puts "check-theme: #{colour_tokens.size} colour tokens, #{violations.size} violations"
+exit 1

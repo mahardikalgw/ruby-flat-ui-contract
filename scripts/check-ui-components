@@ -1,0 +1,264 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Enforces the component-inventory contract (spec FR-001, FR-010, FR-011, FR-012):
+#
+#   INV-1  no raw interactive element outside app/javascript/components/ui
+#   INV-2  focus must stay visible where it carries meaning (FR-092 / SC-013): every
+#          control keeps a :focus-visible outline, no `outline-none` utility appears,
+#          and text fields are the one documented exception (amendment, feature 010)
+#   INV-3  every library component has at least one import site
+#   INV-4  one signed-in shell: every page imports the shared layout, and no layout other
+#          than the sanctioned ones renders a nav/header pair (feature 004, SC-001/SC-012)
+#   INV-5  flat surfaces: no shadow utility and no ring utility anywhere, because both are
+#          box-shadows and the product reads depth from tone, not from elevation (feature 004,
+#          restated by feature 007)
+#   INV-6  no border utility anywhere: white surfaces separate by fill and spacing. `border-0`
+#          is allowed because it is how the form plugin's default border is switched off, and
+#          `border-collapse`/`border-transparent` draw nothing (feature 007)
+#   INV-7  one type scale of seven sizes: no arbitrary `text-[…]`, nothing above `text-2xl`, and no
+#          inline `fontSize` outside the vendored chart primitives (feature 009, contract T1)
+#   INV-8  corners come from a four-value set: `rounded-sm|md|lg|full|none` plus the side variants.
+#          The three token steps resolve to one 5px value (amendment 2026-11-06), so the set is
+#          about staying on tokens, not about offering a scale.
+#          `rounded-xs`, `rounded-xl`, `rounded-2xl`, `rounded-3xl` and `rounded-[…]` are drift
+#          (feature 009, contract R1)
+#   INV-9  tabular figures are declared once in application.css for `table` and `[data-numeric]`, and
+#          nothing opts out with `proportional-nums` (feature 009, contract T4)
+#
+# Exit 0 when clean, 1 when any violation is found.
+
+ROOT = File.expand_path("..", __dir__)
+UI_DIR = File.join(ROOT, "app/javascript/components/ui")
+
+RAW_ELEMENTS = [
+  [ /<button\b/,          "raw interactive element; use a component from components/ui" ],
+  [ /<input\b/,           "raw interactive element; use a component from components/ui" ],
+  [ /<select\b/,          "raw interactive element; use a component from components/ui" ],
+  [ /<textarea\b/,        "raw interactive element; use a component from components/ui" ]
+].freeze
+
+# Feature 002 removed every focus indicator. Feature 003 restored a token-driven ring, so the
+# mechanical rule forbids suppressing focus instead of adding it. Feature 010 amended FR-092:
+# a text field keeps its resting 1px boundary while focused, because the ring on top of that
+# boundary read as a second border on every click. The ring stays for buttons, links, menu and
+# dialog triggers, which is where a keyboard user needs the position announced.
+RING_UTILITIES = [
+  [ /focus(-visible)?:outline-none/, "focus outline suppressed; the focus policy is a visible ring (FR-092)" ],
+  [ /(?:^|[\s"'`])outline-none(?:[\s"'`]|$)/, "outline suppressed; the focus policy is a visible ring (FR-092)" ]
+].freeze
+
+ScannedFile = Struct.new(:path, :lines)
+
+scanned = Dir.glob([
+  File.join(ROOT, "app/javascript/pages/**/*.tsx"),
+  File.join(ROOT, "app/javascript/layouts/**/*.tsx"),
+  File.join(ROOT, "app/javascript/components/**/*.tsx")
+]).reject { |path| path.start_with?("#{UI_DIR}/") }.sort.map do |path|
+  ScannedFile.new(path, File.readlines(path))
+end
+
+violations = []
+
+scanned.each do |file|
+  relative = file.path.delete_prefix("#{ROOT}/")
+
+  file.lines.each_with_index do |line, index|
+    (RAW_ELEMENTS + RING_UTILITIES).each do |pattern, message|
+      violations << "#{relative}:#{index + 1}: #{message}" if line.match?(pattern)
+    end
+  end
+end
+
+# INV-2 (positive half): the stylesheet must actually paint the ring.
+stylesheet = File.join(ROOT, "app/javascript/entrypoints/application.css")
+css = File.read(stylesheet)
+unless css.match?(/:focus-visible[^{]*\{[^}]*outline:\s*[^;]+;/m)
+  violations << "app/javascript/entrypoints/application.css:1: no :focus-visible outline; keyboard focus is invisible (FR-092)"
+end
+
+# INV-2 (amendment, feature 010): text fields must not paint a focus ring, and the stylesheet must
+# be the place that says so. Both halves are checked, so neither can drift back on its own.
+FIELD_COMPONENTS = %w[input.tsx textarea.tsx select.tsx file-input.tsx].freeze
+FIELD_RING = /focus(-visible)?:outline-(?:2|ring)/
+
+FIELD_COMPONENTS.each do |name|
+  path = File.join(UI_DIR, name)
+  next unless File.exist?(path)
+
+  File.readlines(path).each_with_index do |line, index|
+    next unless line.match?(FIELD_RING)
+
+    violations << "app/javascript/components/ui/#{name}:#{index + 1}: field focus ring; a focused field looks unfocused (FR-092 amendment)"
+  end
+end
+
+unless css.match?(/input:focus-visible[^{]*\{[^}]*outline:\s*1px/m)
+  violations << "app/javascript/entrypoints/application.css:1: no field focus exemption; the 2px ring will cover every input (FR-092 amendment)"
+end
+
+# The select trigger is a Radix button, not a native <select>, so the stylesheet exemption above cannot reach it.
+# It therefore has to pin its own resting hairline; without this the 2px ring comes back on that one control.
+select_trigger = File.join(UI_DIR, "select.tsx")
+if File.exist?(select_trigger) && !File.read(select_trigger).include?("focus-visible:outline-1")
+  violations << "app/javascript/components/ui/select.tsx:1: select trigger lost its focus pin; the ring returns on the dropdown (FR-092 amendment)"
+end
+
+# Same amendment, one level down: the highlighted row inside a listbox or menu is announced by its accent fill, so
+# the stylesheet must keep the ring off it. Without this the ring draws a box around the open dropdown's first row.
+unless css.match?(/\[role="option"\]:focus-visible[\s\S]{0,300}?outline:\s*none/)
+  violations << "app/javascript/entrypoints/application.css:1: no listbox/menu focus exemption; every open dropdown paints a ring on its highlighted row (FR-092 amendment)"
+end
+
+# INV-5: no shadows, no rings (feature 004). Both compile to box-shadow, and the product
+# expresses depth with borders; a reintroduced utility would silently undo the flat look.
+SHADOW_UTILITIES = [
+  [ /\bshadow-[a-z0-9\[]/, "shadow utility; the product uses borders, not shadows (INV-5)" ],
+  [ /\bring-(?:\[|[0-9])/, "ring utility; it is a box-shadow and the focus ring is an outline (INV-5)" ]
+].freeze
+
+Dir.glob(File.join(ROOT, "app/javascript/**/*.tsx")).sort.each do |path|
+  relative = path.delete_prefix("#{ROOT}/")
+  File.readlines(path).each_with_index do |line, index|
+    SHADOW_UTILITIES.each do |pattern, message|
+      violations << "#{relative}:#{index + 1}: #{message}" if line.match?(pattern)
+    end
+  end
+end
+
+# INV-6: no border utilities. Surfaces separate by tone, so a reintroduced `border` would put the
+# boxed look straight back. Tokens that draw nothing stay legal, and a colour *role* such as
+# `bg-border` / `outline-border` is not a border utility, so the pattern only matches a standalone
+# utility token.
+BORDER_UTILITY = /(?<![\w-])border(?:-[a-z]+)?(?:-\d+)?(?:\[\d+(?:\.\d+)?px\])?(?:\/\d+)?(?![\w-])/
+BORDER_ALLOWED = %w[border-0 border-collapse border-separate border-transparent border-spacing].freeze
+COMMENT_LINE = %r{\A\s*(?://|/\*|\*)}.freeze
+
+Dir.glob([ File.join(ROOT, "app/javascript/**/*.tsx"), File.join(ROOT, "app/javascript/**/*.ts") ]).sort.each do |path|
+  relative = path.delete_prefix("#{ROOT}/")
+  File.readlines(path).each_with_index do |line, index|
+    next if line.match?(COMMENT_LINE)
+
+    line.scan(BORDER_UTILITY).each do |match|
+      next if BORDER_ALLOWED.any? { |allowed| match.start_with?(allowed) }
+
+      violations << "#{relative}:#{index + 1}: `#{match}` border utility; surfaces separate by tone, not by a line (INV-6)"
+    end
+  end
+end
+
+# INV-7: the seven-step type scale (feature 009, contract T1). An arbitrary size is how a screen drifts —
+# `text-[11px]` was in use 22 times before this rule existed. The vendored chart primitives size their own
+# SVG ticks, so they are the single exemption.
+TYPE_SCALE_EXEMPT = %w[app/javascript/components/ui/chart.tsx].freeze
+ILLEGAL_TEXT_SIZE = [
+  [ /text-\[[^\]]*\]/, "arbitrary font size; use a step from the seven-size scale (INV-7)" ],
+  [ /text-(?:3xl|4xl|5xl|6xl|7xl|8xl|9xl)\b/, "font size above the seventh step (INV-7)" ],
+  [ /\bfontSize:/, "inline fontSize; use a text utility from the scale (INV-7)" ]
+].freeze
+
+Dir.glob(File.join(ROOT, "app/javascript/**/*.tsx")).sort.each do |path|
+  relative = path.delete_prefix("#{ROOT}/")
+  next if TYPE_SCALE_EXEMPT.include?(relative)
+
+  File.readlines(path).each_with_index do |line, index|
+    next if line.match?(COMMENT_LINE)
+
+    ILLEGAL_TEXT_SIZE.each do |pattern, message|
+      violations << "#{relative}:#{index + 1}: #{message}" if line.match?(pattern)
+    end
+  end
+end
+
+# INV-8: the four-value corner set (feature 009, contract R1). The scale already exists as derived tokens;
+# what this rule removes is drift, not design.
+ILLEGAL_RADIUS = [
+  [ /rounded-(?:xs|xl|2xl|3xl|4xl)(?![\w-])/, "corner outside the four-value set; use rounded-sm|md|lg (INV-8)" ],
+  [ /rounded-\[[^\]]*\]/, "arbitrary corner radius; use rounded-sm|md|lg (INV-8)" ]
+].freeze
+# The vendored chart primitives draw 2 px legend swatches; a scale step would make them read as chips.
+RADIUS_EXEMPT = TYPE_SCALE_EXEMPT
+
+Dir.glob([ File.join(ROOT, "app/javascript/**/*.tsx"), File.join(ROOT, "app/javascript/**/*.ts") ]).sort.each do |path|
+  relative = path.delete_prefix("#{ROOT}/")
+  next if RADIUS_EXEMPT.include?(relative)
+
+  File.readlines(path).each_with_index do |line, index|
+    next if line.match?(COMMENT_LINE)
+
+    ILLEGAL_RADIUS.each do |pattern, message|
+      violations << "#{relative}:#{index + 1}: #{message}" if line.match?(pattern)
+    end
+  end
+end
+
+# INV-9: tabular figures declared once (feature 009, contract T4). A rule that lives only in the table
+# recipe is silently bypassed by the next table somebody writes by hand.
+unless css.match?(/font-variant-numeric:\s*tabular-nums/)
+  violations << "app/javascript/entrypoints/application.css:1: no tabular-nums declaration; numeric columns will not align (INV-9)"
+end
+
+Dir.glob([ File.join(ROOT, "app/javascript/**/*.css"), File.join(ROOT, "app/javascript/**/*.tsx") ]).sort.each do |path|
+  relative = path.delete_prefix("#{ROOT}/")
+  File.readlines(path).each_with_index do |line, index|
+    next if line.match?(COMMENT_LINE)
+    next unless line.match?(/font-variant-numeric:\s*proportional-nums/)
+
+    violations << "#{relative}:#{index + 1}: proportional figures opt out of the tabular default (INV-9)"
+  end
+end
+
+# INV-4: one signed-in shell (feature 004). Every page renders inside the shared layout, and
+# only the sanctioned layout files may render navigation or a top bar. A second chrome
+# implementation is how the helpdesk drifted away from the product in the first place.
+SANCTIONED_LAYOUTS = %w[app-layout.tsx dashboard-layout.tsx auth-layout.tsx marketing-layout.tsx].freeze
+
+SANCTIONED_PAGE_LAYOUTS = %w[
+  @/layouts/app-layout @/layouts/dashboard-layout @/layouts/auth-layout @/layouts/marketing-layout
+].freeze
+# The error page renders without chrome only when there is no session to render chrome for.
+LAYOUTLESS_PAGES = %w[app/javascript/pages/errors/show.tsx].freeze
+
+Dir.glob(File.join(ROOT, "app/javascript/pages/**/*.tsx")).sort.each do |path|
+  relative = path.delete_prefix("#{ROOT}/")
+  next if LAYOUTLESS_PAGES.include?(relative)
+  next if SANCTIONED_PAGE_LAYOUTS.any? { |layout| File.read(path).include?(layout) }
+
+  violations << "#{relative}:1: page does not render inside a sanctioned layout (FR-001)"
+end
+
+Dir.glob(File.join(ROOT, "app/javascript/layouts/*.tsx")).sort.each do |path|
+  name = File.basename(path)
+  next if SANCTIONED_LAYOUTS.include?(name)
+
+  body = File.read(path)
+  next unless body.match?(/<nav\b/) && body.match?(/<header\b/)
+
+  relative = path.delete_prefix("#{ROOT}/")
+  violations << "#{relative}:1: a second chrome implementation; use components/workspace (FR-001, SC-012)"
+end
+
+# INV-3: every library component must have at least one import site. Imports from
+# inside the library count too (e.g. toggle-group imports toggle), otherwise a
+# composition-only component would be reported as an orphan.
+component_files = Dir.glob(File.join(UI_DIR, "*.tsx")).sort
+sources = Dir.glob(File.join(ROOT, "app/javascript/**/*.tsx")).sort
+             .map { |path| File.read(path) }
+             .join("\n")
+
+component_files.each do |component_path|
+  name = File.basename(component_path, ".tsx")
+  next if sources.include?("components/ui/#{name}")
+
+  relative = component_path.delete_prefix("#{ROOT}/")
+  violations << "#{relative}:1: component has no import site; remove it or use it (FR-010)"
+end
+
+if violations.empty?
+  puts "check-ui-components: #{component_files.size} components, 0 violations"
+  exit 0
+end
+
+violations.sort.each { |violation| puts violation }
+puts "check-ui-components: #{component_files.size} components, #{violations.size} violations"
+exit 1
